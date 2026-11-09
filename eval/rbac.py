@@ -5,10 +5,12 @@ Run from the project root: python -m eval.rbac --benchmark-dir /path/to/benchmar
 
 import argparse
 import importlib.util
+from itertools import islice
 import json
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 from generate import DEFAULT_MODEL, generate_response, load_generation_model
 
@@ -22,6 +24,89 @@ DB_DIRS = {
     "spider": "data/spider/database",
     #"bird": "data/Bird/dev_20251106/dev_databases",
 }
+
+
+def _iter_json_array(handle):
+    """Decode array entries incrementally, keeping only a chunk and one row."""
+    decoder = json.JSONDecoder()
+    buffer, position, eof = "", 0, False
+
+    def read_more():
+        nonlocal buffer, position, eof
+        # Grow reads for unusually large rows so retries remain linear overall.
+        chunk = handle.read(max(64 * 1024, len(buffer) - position))
+        buffer = buffer[position:] + chunk
+        position = 0
+        eof = not chunk
+
+    def peek():
+        nonlocal position
+        while True:
+            while position < len(buffer) and buffer[position] in " \t\r\n":
+                position += 1
+            if position < len(buffer) or eof:
+                return buffer[position:position + 1]
+            read_more()
+
+    if peek() != "[":
+        raise ValueError("Dataset must contain a nonempty array of records or JSONL records")
+    position += 1
+    if peek() != "]":
+        while True:
+            while True:
+                try:
+                    row, end = decoder.raw_decode(buffer, position)
+                    break
+                except json.JSONDecodeError:
+                    if eof:
+                        raise
+                    read_more()
+            position = end
+            yield row
+            delimiter = peek()
+            if delimiter == "]":
+                break
+            if delimiter != ",":
+                raise ValueError("Expected ',' or ']' after dataset row")
+            position += 1
+            peek()  # Skip whitespace before the next entry.
+    position += 1
+    if peek():
+        raise ValueError("Extra data after dataset array")
+
+
+def iter_dataset(data_path):
+    """Read JSON/JSONL rows without loading the complete dataset into memory."""
+    with data_path.open(encoding="utf-8-sig") as handle:
+        if data_path.suffix == ".jsonl":
+            yield from (json.loads(line) for line in handle if line.strip())
+        else:
+            yield from _iter_json_array(handle)
+
+
+def snapshot_dataset(data_path, role_json, limit=None):
+    """Validate and snapshot the selected rows before loading the model."""
+    # Publish only a complete snapshot, including when input and output coincide.
+    with tempfile.TemporaryDirectory(dir=role_json.parent) as temporary:
+        snapshot = Path(temporary) / role_json.name
+        count = 0
+        with snapshot.open("w", encoding="utf-8") as handle:
+            handle.write("[")
+            rows = iter_dataset(data_path)
+            try:
+                for row in islice(rows, limit):
+                    if not isinstance(row, dict):
+                        raise ValueError("Each dataset row must be a JSON object")
+                    handle.write(",\n  " if count else "\n  ")
+                    handle.write(json.dumps(row, ensure_ascii=False, indent=2).replace("\n", "\n  "))
+                    count += 1
+            finally:
+                rows.close()
+            if not count:
+                raise ValueError("Dataset must contain a nonempty array of records or JSONL records")
+            handle.write("\n]")
+        snapshot.replace(role_json)
+    return count
 
 
 def build_messages(row):
@@ -96,23 +181,18 @@ def main(argv=None):
         if missing:
             parser.error(f"Missing evaluator dependencies: {', '.join(missing)}; see README.md")
 
-    text = data_path.read_text(encoding="utf-8-sig")
-    rows = ([json.loads(line) for line in text.splitlines() if line.strip()]
-            if data_path.suffix == ".jsonl" else json.loads(text))
-    if not isinstance(rows, list) or not rows:
-        parser.error("Dataset must contain a nonempty array of records or JSONL records")
-    rows = rows[:args.limit]
-    if any(not isinstance(row, dict) for row in rows):
-        parser.error("Each dataset row must be a JSON object")
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     role_json = output_dir / "role_data.json"
     predictions = output_dir / "predictions.jsonl"
     # Snapshot exactly the rows used, so --limit preserves evaluator alignment.
-    role_json.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        row_count = snapshot_dataset(data_path, role_json, args.limit)
+    except ValueError as error:
+        parser.error(str(error))
     model, tokenizer = load_generation_model(adapter=args.adapter, model_name=args.model)
     with predictions.open("w", encoding="utf-8") as handle:
-        for index, row in enumerate(rows):
+        for index, row in enumerate(iter_dataset(role_json)):
             response = generate_response(
                 model, tokenizer, build_messages(row), args.max_new_tokens
             )
@@ -123,7 +203,7 @@ def main(argv=None):
                 "raw_response": response,
             }, ensure_ascii=False) + "\n")
             handle.flush()
-            print(f"Generated {index + 1}/{len(rows)}", flush=True)
+            print(f"Generated {index + 1}/{row_count}", flush=True)
     print(f"Predictions: {predictions}", flush=True)
     if args.generate_only:
         return
