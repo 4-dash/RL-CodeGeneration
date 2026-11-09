@@ -14,7 +14,7 @@ Write a Python function that checks whether a number is prime.
 DEFAULT_MODEL = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
 
 
-def load_generation_model(adapter=None, model_name=None):
+def load_generation_model(adapter=None, model_name=None, device_map="auto"):
     """Load a pretrained model, applying a LoRA adapter only when requested."""
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -27,7 +27,7 @@ def load_generation_model(adapter=None, model_name=None):
         base_model = model_name or adapter_config.base_model_name_or_path
     tokenizer = AutoTokenizer.from_pretrained(base_model, cache_dir=cache_dir)
     model = AutoModelForCausalLM.from_pretrained(
-        base_model, cache_dir=cache_dir, device_map="auto", dtype="auto"
+        base_model, cache_dir=cache_dir, device_map=device_map, dtype="auto"
     )
     if adapter is not None:
         model = PeftModel.from_pretrained(model, str(adapter), is_trainable=False)

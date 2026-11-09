@@ -4,13 +4,17 @@ Run from the project root: python -m eval.rbac --benchmark-dir /path/to/benchmar
 """
 
 import argparse
+from contextlib import closing
 import importlib.util
 from itertools import islice
 import json
+import multiprocessing
 from pathlib import Path
+import queue
 import subprocess
 import sys
 import tempfile
+import traceback
 
 from generate import DEFAULT_MODEL, generate_response, load_generation_model
 
@@ -126,6 +130,90 @@ def build_messages(row):
     ]
 
 
+def _generation_worker(gpu, tasks, results, adapter, model_name, max_new_tokens):
+    """Load one model on one GPU and consume shared generation tasks."""
+    try:
+        import torch
+
+        torch.cuda.set_device(gpu)
+        model, tokenizer = load_generation_model(
+            adapter=adapter, model_name=model_name, device_map={"": f"cuda:{gpu}"}
+        )
+        results.put(("ready", gpu, None))
+        for index, row in iter(tasks.get, None):
+            response = generate_response(model, tokenizer, build_messages(row), max_new_tokens)
+            results.put(("response", index, response))
+    except BaseException:
+        results.put(("error", gpu, traceback.format_exc()))
+
+
+def generate_parallel(role_json, row_count, num_gpus, adapter=None, model_name=None,
+                      max_new_tokens=512):
+    """Yield ordered responses with a bounded number of rows in flight."""
+    num_workers = min(num_gpus, row_count)
+    window = 2 * num_workers
+    # Spawn avoids inheriting a CUDA context from the parent process.
+    context = multiprocessing.get_context("spawn")
+    tasks = context.Queue(maxsize=window)
+    results = context.Queue(maxsize=window)
+    workers = []
+
+    def receive():
+        while True:
+            try:
+                kind, index, response = results.get(timeout=0.2)
+            except queue.Empty:
+                for gpu, worker in enumerate(workers):
+                    if worker.exitcode is not None:
+                        raise RuntimeError(f"GPU worker {gpu} exited with code {worker.exitcode}")
+                continue
+            if kind == "error":
+                raise RuntimeError(f"GPU worker {index} failed:\n{response}")
+            return kind, index, response
+
+    try:
+        for gpu in range(num_workers):
+            worker = context.Process(
+                target=_generation_worker,
+                args=(gpu, tasks, results, adapter, model_name, max_new_tokens),
+            )
+            worker.start()
+            workers.append(worker)
+        for _ in workers:
+            receive()  # All models must load before dispatching tasks.
+
+        submitted = emitted = 0
+        pending = {}
+        with closing(iter_dataset(role_json)) as rows:
+            while emitted < row_count:
+                # Bound the window relative to rows written, so a slow early row
+                # cannot cause an unbounded buffer of later responses.
+                while submitted < min(row_count, emitted + window):
+                    tasks.put((submitted, next(rows)))
+                    submitted += 1
+                _, index, response = receive()
+                pending[index] = response
+                while emitted in pending:
+                    yield emitted, pending.pop(emitted)
+                    emitted += 1
+        for _ in workers:
+            tasks.put(None)
+        for worker in workers:
+            worker.join()
+            if worker.exitcode != 0:
+                raise RuntimeError(f"GPU worker exited with code {worker.exitcode}")
+    finally:
+        # Also stop every worker on model failure, output errors or interruption.
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+        for worker in workers:
+            worker.join()
+        for channel in (tasks, results):
+            channel.cancel_join_thread()
+            channel.close()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark-dir", type=Path, required=True,
@@ -137,6 +225,9 @@ def main(argv=None):
     parser.add_argument("--output-dir", type=Path, default=Path("rbac_results"))
     parser.add_argument("--limit", type=int, help="Use only the first N dataset rows.")
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--num-gpus", type=int, default=1,
+                        help="Run parallel generation workers on the first N visible CUDA GPUs. "
+                             "Each worker needs space for a full model; default keeps automatic model placement.")
     parser.add_argument("--db-dir", type=Path, help="Override the SQLite database directory.")
     parser.add_argument("--schemas", type=Path, help="Upstream schema snapshot JSON (no execution).")
     parser.add_argument("--execute-sql", action="store_true",
@@ -146,6 +237,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.max_new_tokens < 1 or (args.limit is not None and args.limit < 1):
         parser.error("--max-new-tokens and --limit must be positive")
+    if args.num_gpus < 1:
+        parser.error("--num-gpus must be positive")
     if args.execute_sql and args.dataset == "livesqlbench":
         parser.error("upstream --execute_sql supports Spider/BIRD SQLite only")
     if args.adapter is not None and not (args.adapter / "adapter_model.safetensors").is_file():
@@ -180,6 +273,12 @@ def main(argv=None):
         missing = [name for name in required if importlib.util.find_spec(name) is None]
         if missing:
             parser.error(f"Missing evaluator dependencies: {', '.join(missing)}; see README.md")
+    if args.num_gpus > 1:
+        import torch
+
+        available = torch.cuda.device_count()
+        if args.num_gpus > available:
+            parser.error(f"--num-gpus requests {args.num_gpus} GPUs, but only {available} CUDA GPUs are visible")
 
     output_dir = args.output_dir.resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -190,12 +289,18 @@ def main(argv=None):
         row_count = snapshot_dataset(data_path, role_json, args.limit)
     except ValueError as error:
         parser.error(str(error))
-    model, tokenizer = load_generation_model(adapter=args.adapter, model_name=args.model)
-    with predictions.open("w", encoding="utf-8") as handle:
-        for index, row in enumerate(iter_dataset(role_json)):
-            response = generate_response(
-                model, tokenizer, build_messages(row), args.max_new_tokens
-            )
+    if args.num_gpus > 1:
+        print(f"Generating with {min(args.num_gpus, row_count)} GPU workers", flush=True)
+        responses = generate_parallel(role_json, row_count, args.num_gpus,
+                                      args.adapter, args.model, args.max_new_tokens)
+    else:
+        model, tokenizer = load_generation_model(adapter=args.adapter, model_name=args.model)
+        responses = (
+            (index, generate_response(model, tokenizer, build_messages(row), args.max_new_tokens))
+            for index, row in enumerate(iter_dataset(role_json))
+        )
+    with closing(responses), predictions.open("w", encoding="utf-8") as handle:
+        for index, response in responses:
             # JSONL preserves multiline SQL and empty predictions without shifting rows.
             handle.write(json.dumps({
                 "source_index": index,
