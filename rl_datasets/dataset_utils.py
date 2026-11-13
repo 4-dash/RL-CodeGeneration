@@ -3,6 +3,9 @@ from rl_datasets.dataset_helper import BaseDatasetHelper
 from rl_datasets.dataset_special_functions import *
 
 def get_dataset(dataset_name, model_or_tokenizer_name, cache_dir, tokenize_targets=True, eval_mode = False):
+    if dataset_name == 'sharkiefff/RBAC-Text2SQL-Benchmark':
+        from rl_datasets.sql_dataset import SQLDatasetHelper
+        return SQLDatasetHelper(model_or_tokenizer_name, cache_dir)
     if dataset_name == 'code_search_net':
         return get_code_search_net_dataset(model_or_tokenizer_name, cache_dir, tokenize_targets, eval_mode = eval_mode)
     elif dataset_name == 'codeparrot/xlcost-text-to-code':
