@@ -21,12 +21,12 @@ from generate import DEFAULT_MODEL, generate_response, load_generation_model
 
 DATA_FILES = {
     "spider": "spider/column_level_rbac_dataset_spider_v3_no_sm.json",
-    #"bird": "bird/column_level_rbac_dataset_bird_v3_no_sm.json",
+    "bird": "bird/column_level_rbac_dataset_bird_v3_no_sm.json",
     #"livesqlbench": "livesqlbench-full/crud_rbac_dataset_v3_no_sm.json",
 }
 DB_DIRS = {
     "spider": "data/spider/database",
-    #"bird": "data/Bird/dev_20251106/dev_databases",
+    "bird": "data/Bird/dev_databases",
 }
 
 
