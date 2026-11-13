@@ -56,6 +56,7 @@ class SampleTrainingScriptTests(unittest.TestCase):
             "RBAC_PYTHON": sys.executable,
             "RBAC_BENCHMARK_DIR": str(self.benchmark),
             "RBAC_TRAIN_RUNS_DIR": str(self.runs),
+            "RBAC_TRAIN_DATA": str(self.source),
         })
 
     def run_script(self, **overrides):
@@ -105,6 +106,32 @@ class SampleTrainingScriptTests(unittest.TestCase):
         args = launch['args']
         self.assertEqual(args[args.index('--num_processes') + 1], '4')
         self.assertIn('fake training output', (run / 'training.log').read_text())
+
+    def test_default_source_is_downloaded_from_hugging_face_before_sampling(self):
+        module_dir = self.root / "modules"
+        module_dir.mkdir()
+        request = self.root / "hub_request.json"
+        (module_dir / "huggingface_hub.py").write_text(
+            "import json, os\n"
+            "from pathlib import Path\n"
+            "def hf_hub_download(**kwargs):\n"
+            "    Path(os.environ['SAMPLE_TEST_HUB_REQUEST']).write_text(json.dumps(kwargs))\n"
+            "    return os.environ['SAMPLE_TEST_HUB_SOURCE']\n"
+        )
+        result = self.run_script(
+            RBAC_TRAIN_DATA="", PYTHONPATH=str(module_dir), HF_HOME=str(self.root / "cache"),
+            SAMPLE_TEST_HUB_REQUEST=str(request), SAMPLE_TEST_HUB_SOURCE=str(self.source),
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(json.loads(request.read_text()), {
+            "repo_id": "sharkiefff/RBAC-Text2SQL-Benchmark", "repo_type": "dataset",
+            "filename": "spider/column_level_rbac_dataset_spider_train_v3_no_sm.json",
+            "cache_dir": str(self.root / "cache"),
+        })
+        run, = self.runs.iterdir()
+        self.assertEqual(len(json.loads((run / "sample.json").read_text())), 256)
+        launch = json.loads((run / "launch.json").read_text())
+        self.assertEqual(launch["sample"], str(run / "sample.json"))
 
 
 if __name__ == '__main__':

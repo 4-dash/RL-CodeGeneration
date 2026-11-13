@@ -15,6 +15,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from eval.rbac import build_messages
+from rl_datasets.sql_dataset import resolve_training_data
 
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -154,14 +155,46 @@ class SQLDatasetTests(unittest.TestCase):
         }
         with patch.dict(sys.modules, dependencies):
             module = load_file("sql_dataset_test", "rl_datasets/sql_dataset.py")
-        with patch.dict(os.environ, {"RBAC_BENCHMARK_DIR": "/unused"}):
-            with patch.object(module, "iter_dataset", return_value=iter(rows)):
-                module.SQLDatasetHelper("unused-model", "/unused-cache")
+            with patch.dict(os.environ, {"RBAC_BENCHMARK_DIR": "/unused"}):
+                with patch.object(module, "iter_dataset", return_value=iter(rows)), \
+                     patch.object(module, "resolve_training_data", return_value=Path("/training.json")) as resolve:
+                    module.SQLDatasetHelper("unused-model", "/unused-cache")
+        resolve.assert_called_once_with("/unused-cache")
         self.assertTrue(all(isinstance(row, str) for row in serialized["row_json"]))
         for original, prepared, call in zip(rows, processed, tokenizer.apply_chat_template.call_args_list):
             self.assertEqual(call.args[0], build_messages(original))
             self.assertEqual(json.loads(prepared["reward_metadata"])["policy"], original["policy"])
         self.assertEqual(rows[0]["policy"], {"alpha": ["x"]})
+
+
+class TrainingDataSourceTests(unittest.TestCase):
+    def test_default_downloads_only_the_training_file_to_configured_cache(self):
+        download = Mock(return_value="/cache/spider/training.json")
+        with patch.dict(os.environ, {"RBAC_TRAIN_DATA": ""}), \
+             patch.dict(sys.modules, {"huggingface_hub": SimpleNamespace(hf_hub_download=download)}):
+            path = resolve_training_data("/configured/cache")
+        self.assertEqual(path, Path("/cache/spider/training.json"))
+        download.assert_called_once_with(
+            repo_id="sharkiefff/RBAC-Text2SQL-Benchmark", repo_type="dataset",
+            filename="spider/column_level_rbac_dataset_spider_train_v3_no_sm.json",
+            cache_dir="/configured/cache",
+        )
+
+    def test_local_override_bypasses_hugging_face(self):
+        download = Mock(side_effect=AssertionError("Local files must not download anything"))
+        with patch.dict(os.environ, {"RBAC_TRAIN_DATA": "~/training.jsonl"}), \
+             patch.dict(sys.modules, {"huggingface_hub": SimpleNamespace(hf_hub_download=download)}):
+            path = resolve_training_data("/unused/cache")
+        self.assertEqual(path, Path("~/training.jsonl").expanduser().resolve())
+        download.assert_not_called()
+
+    def test_download_failure_is_not_replaced_with_evaluation_data(self):
+        download = Mock(side_effect=ConnectionError("offline and not cached"))
+        with patch.dict(os.environ, {"RBAC_TRAIN_DATA": ""}), \
+             patch.dict(sys.modules, {"huggingface_hub": SimpleNamespace(hf_hub_download=download)}):
+            with self.assertRaisesRegex(ConnectionError, "not cached"):
+                resolve_training_data("/configured/cache")
+        download.assert_called_once()
 
 
 def load_save_model():

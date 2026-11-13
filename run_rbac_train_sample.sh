@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run in the existing training environment. No downloads/setup are performed here.
+# Run in the existing training environment. Training JSON is fetched from HF if needed.
 # Example: RBAC_BENCHMARK_DIR=/path/to/benchmark bash run_rbac_train_sample.sh
 set -euo pipefail
 
@@ -18,7 +18,7 @@ Optional environment variables:
   RBAC_SAMPLE_SIZE=256        Random training rows (must be less than the source).
   RBAC_SAMPLE_SEED=42         Reproducible sampling seed.
   RBAC_NUM_GPUS=2             Number of GPU processes; CUDA_VISIBLE_DEVICES applies.
-  RBAC_TRAIN_DATA=...         Source training JSON/JSONL; defaults to Spider train.
+  RBAC_TRAIN_DATA=...         Local training JSON/JSONL; default downloads Spider train from HF.
   RBAC_TRAIN_DB_DIR=...       Spider SQLite database root.
   RBAC_TRAIN_RUNS_DIR=...     Parent for fresh, separate pilot run directories.
   RBAC_PYTHON=python3         Python in the activated training environment.
@@ -37,9 +37,16 @@ command -v accelerate >/dev/null
 cd -- "$PROJECT_DIR"
 export RBAC_BENCHMARK_DIR
 export RBAC_TRAIN_DB_DIR="${RBAC_TRAIN_DB_DIR:-$RBAC_BENCHMARK_DIR/data/spider/database}"
-SOURCE_DATA="${RBAC_TRAIN_DATA:-$RBAC_BENCHMARK_DIR/data/selected/spider/column_level_rbac_dataset_spider_train_v3_no_sm.json}"
 [[ -f "$RBAC_BENCHMARK_DIR/rbac-exp/evaluation/prediction_policy.py" ]] \
     || { printf 'Current benchmark prediction_policy.py is missing.\n' >&2; exit 1; }
+SOURCE_DATA="$("$PYTHON" - <<'PY'
+import os
+from rl_datasets.sql_dataset import resolve_training_data
+
+cache_dir = os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface"))
+print(resolve_training_data(cache_dir))
+PY
+)"
 [[ -f "$SOURCE_DATA" ]] || { printf 'Training data not found: %s\n' "$SOURCE_DATA" >&2; exit 1; }
 mkdir -p -- "$RUNS_DIR"
 RUN_DIR="$(mktemp -d "$RUNS_DIR/run_$(date -u +%Y%m%dT%H%M%SZ)_XXXXXX")"

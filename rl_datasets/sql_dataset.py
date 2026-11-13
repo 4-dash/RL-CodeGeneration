@@ -4,20 +4,35 @@ import json
 import os
 from pathlib import Path
 
-from accelerate import PartialState
-from datasets import Dataset, DatasetDict
-from transformers import AutoConfig, AutoTokenizer
-
 from eval.rbac import build_messages, iter_dataset
-from rewards.sql_rewards import SQLScorer
+
+
+def resolve_training_data(cache_dir):
+    local_path = os.environ.get("RBAC_TRAIN_DATA")
+    if local_path:
+        return Path(local_path).expanduser().resolve()
+
+    from huggingface_hub import hf_hub_download
+
+    # Read raw JSON to avoid Arrow adding null entries to policy dictionaries.
+    return Path(hf_hub_download(
+        repo_id="sharkiefff/RBAC-Text2SQL-Benchmark",
+        repo_type="dataset",
+        filename="spider/column_level_rbac_dataset_spider_train_v3_no_sm.json",
+        cache_dir=cache_dir,
+    ))
 
 
 class SQLDatasetHelper:
     def __init__(self, model_name, cache_dir):
+        # The sample script also uses this module to locate data without loading
+        # the training stack. Import training dependencies only when needed.
+        from accelerate import PartialState
+        from datasets import Dataset, DatasetDict
+        from transformers import AutoConfig, AutoTokenizer
+        from rewards.sql_rewards import SQLScorer
+
         benchmark = Path(os.environ["RBAC_BENCHMARK_DIR"]).expanduser().resolve()
-        data_path = Path(os.environ.get(
-            "RBAC_TRAIN_DATA", str(benchmark / "data/selected/spider/column_level_rbac_dataset_spider_train_v3_no_sm.json")
-        )).expanduser()
         db_dir = Path(os.environ.get(
             "RBAC_TRAIN_DB_DIR", str(benchmark / "data/spider/database")
         )).expanduser().resolve()
@@ -53,6 +68,7 @@ class SQLDatasetHelper:
                     "reward_metadata": json.dumps(metadata)}
 
         with PartialState().local_main_process_first():
+            data_path = resolve_training_data(cache_dir)
             # Arrow unifies dictionary keys across rows. Keep raw rows serialized
             # until prompting/scoring metadata is prepared so policies stay exact.
             dataset = Dataset.from_dict({
