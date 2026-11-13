@@ -7,6 +7,7 @@ import tempfile
 
 from codebleu import calc_codebleu
 from rewards.reward_helper import *
+from rewards.sql_rewards import sql_outcome_reward
 
 def robo_instruct_sim_reward(postprocessed_responses, processing_class: PreTrainedTokenizerBase, scoress, labels, **kwargs):
     rewardss = []

@@ -1,6 +1,7 @@
 import shutil
 
-from datasets import DatasetDict
+from datasets import DatasetDict, concatenate_datasets
+from accelerate import PartialState
 from typing import Optional, List, Dict, Any, Union
 from wrappers.wrapper_utils import *
 from trl.trainer.ppo_trainer import *
@@ -30,15 +31,36 @@ class PPOWrapper(PPOTrainer):
         self.syncode_coef = framework_params['syncode_coef']
         self.linter_coef = framework_params['linter_coef']
         self.rewards_coefs = framework_params['rewards_coef']
+        self.sql_task = framework_params.get("task") == "sql"
+        self.reward_kwargs = getattr(dataset_helper, "reward_kwargs", {})
 
         if isinstance(dataset_helper.tokenized_dataset , (Dataset, DatasetDict)):
             processed_dataset_for_model_generation = dataset_helper.preprocess_dataset()
         else:
             processed_dataset_for_model_generation = dataset_helper.tokenized_dataset
 
+        if self.sql_task:
+            if dataset_helper.model_input_size + ppo_args.response_length > dataset_helper.context_limit:
+                raise ValueError("SQL prompts plus response_length exceed model context; prompts were not truncated")
+            # PPO expects complete distributed batches. Repeat only enough rows to
+            # fill the final batch instead of dropping any training examples.
+            train = processed_dataset_for_model_generation["train"]
+            batch_size = (ppo_args.per_device_train_batch_size * ppo_args.gradient_accumulation_steps
+                          * ppo_args.num_mini_batches * PartialState().num_processes)
+            extra = (-len(train)) % batch_size
+            if extra:
+                train = concatenate_datasets([train, train.select([i % len(train) for i in range(extra)])])
+            print(f"SQL training: {len(train) - extra} rows, {extra} final-batch repeats")
+            processed_dataset_for_model_generation["train"] = train
+            # Required by the base trainer; not held-out validation or selection.
+            processed_dataset_for_model_generation["test"] = train.select([0])
+            ppo_args.total_episodes = len(train)
+            if os.path.isdir(ppo_args.output_dir) and os.listdir(ppo_args.output_dir):
+                raise FileExistsError(f"SQL training output is not empty: {ppo_args.output_dir}")
+
         ref_policy, model, critic, peft_config = load_model(cache_dir, model_args, adapter_path)
 
-        if adapter_path is None:
+        if adapter_path is None and not self.sql_task:
             # Remove Output_dir if it exists
             shutil.rmtree(ppo_args.output_dir, ignore_errors=True)
 
@@ -56,8 +78,11 @@ class PPOWrapper(PPOTrainer):
             eval_dataset=processed_dataset_for_model_generation["test"],
             data_collator=collator
         )
-        self.syncode_logits_processor = SyncodeLogitsListWrapper(dataset_helper.tokenizer, self.args.local_rollout_forward_batch_size)
-        self.linter_function = ruff_linter_reward
+        self.syncode_logits_processor = None
+        self.linter_function = None
+        if not self.sql_task:
+            self.syncode_logits_processor = SyncodeLogitsListWrapper(dataset_helper.tokenizer, self.args.local_rollout_forward_batch_size)
+            self.linter_function = ruff_linter_reward
 
     def train(self):
         args = self.args
@@ -80,9 +105,11 @@ class PPOWrapper(PPOTrainer):
             top_k=0.0,
             top_p=0.95,
             do_sample=True,
+            suppress_tokens=[processing_class.pad_token_id] if self.sql_task else None,
         )
 
-        self.syncode_logits_processor.do_sample = generation_config.do_sample
+        if self.syncode_logits_processor is not None:
+            self.syncode_logits_processor.do_sample = generation_config.do_sample
 
         accelerator.print("===training policy===")
         start_time = time.time()
@@ -152,12 +179,11 @@ class PPOWrapper(PPOTrainer):
                         args.local_rollout_forward_batch_size,
                         processing_class.pad_token_id,
                         generation_config,
-                        [self.syncode_logits_processor],
+                        None if self.sql_task else [self.syncode_logits_processor],
                     )
-
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                    syncode_score = syncode_scores[i: i + args.local_rollout_forward_batch_size]
+                    syncode_score = None if self.sql_task else syncode_scores[i: i + args.local_rollout_forward_batch_size]
                     label = labels[i: i + args.local_rollout_forward_batch_size]
                     if unit_tests is not None:
                         unit_test = unit_tests[i: i + args.local_rollout_forward_batch_size]
@@ -188,6 +214,9 @@ class PPOWrapper(PPOTrainer):
 
                     # Response Processing 2. run reward model on the truncated responses
                     sequence_length = first_true_indices(postprocessed_response == processing_class.pad_token_id) - 1
+                    if self.sql_task:
+                        # Keep one position for an empty response's -1 penalty.
+                        sequence_length = sequence_length.clamp(min=0)
                     unwrapped_value_model = accelerator.unwrap_model(model).value_model
 
                     full_value, _, _ = get_reward(
@@ -195,11 +224,14 @@ class PPOWrapper(PPOTrainer):
                     )
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
 
-                    score, _ = self.linter_function(
-                            postprocessed_response,
-                            processing_class
-                        )
-                    score = self.linter_coef * score.to(syncode_score.device) + self.syncode_coef * syncode_score
+                    if self.sql_task:
+                        score = torch.zeros_like(postprocessed_response, dtype=torch.bfloat16)
+                    else:
+                        score, _ = self.linter_function(
+                                postprocessed_response,
+                                processing_class
+                            )
+                        score = self.linter_coef * score.to(syncode_score.device) + self.syncode_coef * syncode_score
 
                     if unit_tests is not None:
                         kwargs = {
@@ -207,6 +239,10 @@ class PPOWrapper(PPOTrainer):
                         }
                     else:
                         kwargs = {}
+
+                    if self.sql_task:
+                        kwargs.update(self.reward_kwargs)
+                        kwargs["reward_metadata"] = data["reward_metadata"][i:i + args.local_rollout_forward_batch_size]
 
                     if self.use_extra_rewards:
                         rewards = torch.zeros_like(score, dtype=torch.bfloat16).to(postprocessed_response.device)
@@ -449,13 +485,16 @@ class PPOWrapper(PPOTrainer):
 
         # HF trainer specifics
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
-        if self.control.should_save:
+        if self.sql_task or self.control.should_save:
             #model.save_pretrained()
             self._save_checkpoint(model, trial=None)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-        self.generate_completions(sampling=True)
+        if not self.sql_task:
+            self.generate_completions(sampling=True)
 
     def generate_completions(self, sampling: bool = False):
+        if self.sql_task:
+            raise ValueError("Use eval/rbac.py with the saved SQL policy adapter for generation/evaluation")
         args = self.args
         processing_class = self.processing_class
         generation_config = GenerationConfig(
@@ -629,26 +668,21 @@ class PPOWrapper(PPOTrainer):
         self._save_checkpoint(self.model, trial=None)
 
     def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
-        backup_model = self.model
-        value_model = self.model.value_model
-        self.model = self.model.policy  # save only the policy
-
-        if self.is_deepspeed_enabled:
-            backup_deepspeed = self.deepspeed
-            self.deepspeed = self.model
+        # ZeRO-2 keeps complete model parameters on each rank; only rank 0 writes.
+        if not self.accelerator.is_main_process:
+            return
+        model = self.accelerator.unwrap_model(self.model)
+        output_dir = output_dir or self.args.output_dir
 
         output_dir_policy = os.path.join(output_dir, "policy")
         output_dir_value = os.path.join(output_dir, "value")
 
         os.makedirs(output_dir, exist_ok=True)
 
-        self.model.save_pretrained(output_dir_policy)
-        value_model.save_pretrained(output_dir_value)
-
-        self.model = backup_model
-
-        if self.is_deepspeed_enabled:
-            self.deepspeed = backup_deepspeed
+        model.policy.save_pretrained(output_dir_policy)
+        if self.sql_task:
+            self.processing_class.save_pretrained(output_dir_policy)
+        model.value_model.save_pretrained(output_dir_value)
 
     def test_generation(self):
         args = self.args
