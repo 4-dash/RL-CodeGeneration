@@ -18,12 +18,17 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--mode', default="fine_tune", choices=["fine_tune", "evaluate_roboeval", "evaluate_passk", "generate_completion"])
-    parser.add_argument('--param', default="ppo_code_gen", choices=["ppo", "ppo_code_gen"])
-    parser.add_argument('--framework_params', default="code_gen", choices=["code_gen", "robo"])
+    parser.add_argument('--param', default="ppo_code_gen", choices=["ppo", "ppo_code_gen", "ppo_sql"])
+    parser.add_argument('--framework_params', default="code_gen", choices=["code_gen", "robo", "sql"])
     parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Save this training run in a separate directory.")
 
     args = parser.parse_args()
     training_args, model_args, script_args, framework_params, reward_functions = parse_json_file(params=args.param, framework_params=args.framework_params)
+    if args.output_dir is not None:
+        training_args.output_dir = args.output_dir
+        training_args.logging_dir = os.path.join(args.output_dir, "logs")
 
     if not args.checkpoint is None:
         adapter_path = "savings/" + model_args.model_name_or_path + "/" + script_args.dataset_name + "/" + args.checkpoint + "/policy"

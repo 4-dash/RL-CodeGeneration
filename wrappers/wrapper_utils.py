@@ -151,8 +151,11 @@ class StringAdaptedDataCollator(DataCollatorWithPadding):
 
     def __call__(self, features):
         unit_tests = [f.pop("unit_tests", None) for f in features]
+        reward_metadata = [f.pop("reward_metadata", None) for f in features]
         batch = super().__call__(features)  # pads to longest in batch
         if any(ut is not None for ut in unit_tests):
             batch["unit_tests"] = unit_tests
+        if any(item is not None for item in reward_metadata):
+            batch["reward_metadata"] = reward_metadata
         return batch
 
