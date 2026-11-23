@@ -8,17 +8,18 @@ from torch import nn
 class SyncodeLogitsListWrapper(SyncodeLogitsProcessor):
     def __init__(self, tokenizer: PreTrainedTokenizer,
                  local_forward_batch_size,
-                 mode: Literal["original", "grammar_mask", "grammar_strict"] = "grammar_mask"
+                 mode: Literal["original", "grammar_mask", "grammar_strict"] = "grammar_mask",
+                 language: Literal["python", "sql"] = "python",
                  ):
         # Check inputs
         valid_modes = ["original", "grammar_mask", "grammar_strict"]
         if mode not in valid_modes:
             raise ValueError(f"Mode must be one of {valid_modes}, got {mode}")
 
-        grammar = Grammar("python")
+        grammar = Grammar(language)
 
         super().__init__(grammar, tokenizer, mode=mode)
-        self.logit_processors = [SyncodeLogitsProcessorHelper(self.grammar_engine) for _ in range(local_forward_batch_size)]
+        self.logit_processors = [SyncodeLogitsProcessorHelper(self.grammar_engine, language) for _ in range(local_forward_batch_size)]
         self.input_size = 0
 
     def get_scores(self):
@@ -40,11 +41,13 @@ class SyncodeLogitsListWrapper(SyncodeLogitsProcessor):
 class SyncodeLogitsProcessorHelper:
 
     def __init__(self,
-                 grammar_engine: GrammarConstrainer
+                 grammar_engine: GrammarConstrainer,
+                 language: Literal["python", "sql"] = "python",
                  ):
 
         self.do_sample = True
         self.grammar_engine = grammar_engine
+        self.language = language
         self.reward = []
         self.input_size = None
         self.start_from = 0
@@ -73,6 +76,8 @@ class SyncodeLogitsProcessorHelper:
             self.start_from = self.input_size
 
     def code_generation_started(self, input_ids: torch.LongTensor):
+        if self.language == "sql":
+            return True  # SQL prompts request raw output, without Python code fences.
         generated_text = input_ids[:, self.input_size:]
         generated_text = self.grammar_engine.tokenizer.batch_decode(generated_text)[0]
         if "```python" in generated_text:
@@ -84,6 +89,8 @@ class SyncodeLogitsProcessorHelper:
         return False
 
     def code_generation_finished(self, input_ids: torch.LongTensor):
+        if self.language == "sql":
+            return False  # Raw SQL has no closing code fence.
         generated_text = input_ids[:, self.input_size:]
         generated_text = self.grammar_engine.tokenizer.batch_decode(generated_text)[0]
         if "```" in generated_text:

@@ -151,7 +151,7 @@
       "reward_functions": [
         "sql_outcome_reward"
       ],
-      "syncode_coef": 0.0,
+      "syncode_coef": 0.1,
       "linter_coef": 0.0,
       "rewards_coef": [
         1.0

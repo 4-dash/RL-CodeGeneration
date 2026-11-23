@@ -48,13 +48,20 @@ class SQLScoringTests(unittest.TestCase):
             connection.execute("CREATE TABLE t (x INTEGER)")
             connection.execute("INSERT INTO t VALUES (1)")
             connection.commit()
-        self.scorer = sql_rewards.SQLScorer.__new__(sql_rewards.SQLScorer)
-        self.scorer.db_dir = self.root
-        self.scorer.references = {}
-        self.scorer.clean = Mock(side_effect=self.clean)
-        self.scorer.checker = Mock()
-        self.scorer.checker.check.return_value = {"status": "PASS", "not_checked": []}
-        self.scorer.result_eq = lambda result, gold, order_matters: result == gold
+        policy_file = self.root / "rbac-exp/evaluation/prediction_policy.py"
+        policy_file.parent.mkdir(parents=True)
+        policy_file.touch()
+        checker = Mock()
+        checker.check.return_value = {"status": "PASS", "not_checked": []}
+        dependencies = {
+            "data_process.response_cleaner": SimpleNamespace(clean_model_response=Mock(side_effect=self.clean)),
+            "evaluation.prediction_policy": SimpleNamespace(PolicyChecker=Mock(return_value=checker)),
+            "evaluation.exec_eval": SimpleNamespace(result_eq=lambda result, gold, order_matters: result == gold),
+            "sqlglot": SimpleNamespace(errors=SimpleNamespace(ParseError=SyntaxError, TokenError=SyntaxError)),
+            "sqlfluff": SimpleNamespace(lint=Mock(return_value=[])),
+        }
+        with patch.dict(sys.modules, dependencies), patch.object(sys, "path", sys.path.copy()):
+            self.scorer = sql_rewards.SQLScorer(self.root, self.root)
         # SQL parsing and policy checking are external dependencies; execution
         # below uses actual read-only SQLite, not a mock result.
         self.scorer.read_query = Mock(return_value=SimpleNamespace(args={}))
@@ -84,16 +91,188 @@ class SQLScoringTests(unittest.TestCase):
             self.assertEqual(self.scorer.score(response, self.row("denied")), 1)
             self.assertEqual(self.scorer.score(response, self.row()), -1)
 
+    def test_refusal_check_ignores_case_and_outer_whitespace(self):
+        for response in ("  sorry, i cannot answer.\n", "\tSORRY, I CANNOT ANSWER.  ",
+                         "SoRrY, I CaNnOt AnSwEr."):
+            with self.subTest(response=response), patch.object(self.scorer, "clean", return_value=response):
+                self.assertEqual(self.scorer.score(response, self.row("denied")), 1)
+                self.assertEqual(self.scorer.score(response, self.row()), -1)
+        self.scorer.read_query.assert_not_called()
+        self.scorer.checker.check.assert_not_called()
+
     def test_sql_containing_refusal_words_is_scored_as_sql(self):
         sql = "SELECT 'sorry, I cannot answer.'"
-        self.assertEqual(self.scorer.score(sql, self.row(gold=sql)), 1)
+        self.assertAlmostEqual(self.scorer.score(sql, self.row(gold=sql)), 1.0)
         self.assertEqual(self.scorer.score(sql, self.row("denied", gold=sql)), -1)
 
     def test_sql_requires_policy_and_correct_execution_results(self):
-        self.assertEqual(self.scorer.score("SELECT x FROM t", self.row()), 1)
-        self.assertEqual(self.scorer.score("SELECT 2", self.row()), -1)
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 1.0)
+        self.assertAlmostEqual(self.scorer.score("SELECT 2", self.row()), -0.45)
         self.scorer.checker.check.return_value = {"status": "BLOCK"}
-        self.assertEqual(self.scorer.score("SELECT x FROM t", self.row()), -1)
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), -0.7)
+
+    def test_invalid_syntax_skips_policy_and_all_execution(self):
+        for error in (ValueError("unsupported SQL"), SyntaxError("invalid SQL")):
+            with self.subTest(error=error), patch.object(self.scorer, "execute") as execute:
+                self.scorer.read_query.side_effect = error
+                self.assertEqual(self.scorer.score("SELECT broken", self.row()), -0.9)
+                self.scorer.checker.check.assert_not_called()
+                execute.assert_not_called()
+                self.scorer.lint_sql.assert_not_called()
+
+    def test_failed_or_incomplete_policy_skips_all_execution(self):
+        for access in ({"status": "BLOCK"}, {"status": "PASS", "not_checked": ["unknown"]}):
+            with self.subTest(access=access), patch.object(self.scorer, "execute") as execute:
+                self.scorer.checker.check.return_value = access
+                self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), -0.7)
+                execute.assert_not_called()
+                self.scorer.lint_sql.assert_not_called()
+
+    def test_total_rewards_match_current_stage_weights(self):
+        totals = [self.scorer.score("", self.row()),
+                  self.scorer.score("Sorry, I cannot answer.", self.row())]
+        with patch.object(self.scorer, "read_query", side_effect=ValueError("invalid SQL")):
+            totals.append(self.scorer.score("SELECT broken", self.row()))
+        self.scorer.checker.check.return_value = {"status": "BLOCK"}
+        totals.append(self.scorer.score("SELECT x FROM t", self.row()))
+        self.scorer.checker.check.return_value = {"status": "PASS", "not_checked": []}
+        totals.append(self.scorer.score("SELECT 2", self.row()))
+        self.scorer.lint_sql.return_value = [{"code": rule} for rule in self.scorer.sqlfluff_rules]
+        totals.append(self.scorer.score("SELECT x FROM t", self.row()))
+        self.scorer.lint_sql.return_value = []
+        totals.append(self.scorer.score("SELECT x FROM t", self.row()))
+        # Output and refusal failures tie; later stages keep prior rewards.
+        for actual, expected in zip(totals, [-1.0, -1.0, -0.9, -0.7, -0.45, 0.9, 1.0]):
+            self.assertAlmostEqual(actual, expected)
+
+    def test_refusal_and_denied_sql_skip_sql_checks(self):
+        for response, permission, expected in (
+            ("Sorry, I cannot answer.", "denied", 1),
+            ("Sorry, I cannot answer.", "allowed", -1),
+            ("SELECT x FROM t", "denied", -1),
+        ):
+            with self.subTest(response=response, permission=permission), \
+                 patch.object(self.scorer, "execute") as execute:
+                self.assertEqual(self.scorer.score(response, self.row(permission)), expected)
+                self.scorer.read_query.assert_not_called()
+                self.scorer.checker.check.assert_not_called()
+                execute.assert_not_called()
+                self.scorer.lint_sql.assert_not_called()
+
+    def test_execution_error_keeps_earlier_rewards(self):
+        self.assertAlmostEqual(self.scorer.score("SELECT missing FROM t", self.row()), -0.45)
+        self.scorer.lint_sql.assert_called_once()
+
+    def test_incorrect_results_keep_sqlfluff_rewards(self):
+        for failed_rules, expected in (([], -0.45), (self.scorer.sqlfluff_rules, -0.55)):
+            with self.subTest(failed_rules=failed_rules):
+                self.scorer.lint_sql.reset_mock()
+                self.scorer.lint_sql.return_value = [{"code": rule} for rule in failed_rules]
+                self.assertAlmostEqual(self.scorer.score("SELECT 2", self.row()), expected)
+                self.scorer.lint_sql.assert_called_once()
+
+    def test_sqlfluff_runs_before_final_execution(self):
+        self.assertEqual(list(self.scorer.reward_steps)[-2:], ["sqlfluff", "execution"])
+        calls = Mock()
+        calls.attach_mock(self.scorer.lint_sql, "lint")
+        with patch.object(self.scorer, "execute", wraps=self.scorer.execute) as execute:
+            calls.attach_mock(execute, "execute")
+            self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 1.0)
+        self.assertEqual([call[0] for call in calls.mock_calls], ["lint", "execute", "execute"])
+        self.scorer.lint_sql.assert_called_once_with(
+            "SELECT x FROM t", dialect="sqlite", rules=["LT01", "CP01", "LT06", "CP03"],
+        )
+        self.scorer.lint_sql.return_value = [{"code": "LT01"}]
+        self.assertAlmostEqual(self.scorer.score("SELECT  x FROM t", self.row()), 0.975)
+
+    def test_sqlfluff_rewards_each_passing_rule_once(self):
+        for codes, expected in (([], 1.0), (["LT01", "LT01"], 0.975),
+                                (["LT01", "CP01"], 0.95),
+                                (["LT01", "CP01", "LT06"], 0.925),
+                                (["LT01", "CP01", "LT06", "CP03"], 0.9)):
+            with self.subTest(codes=codes):
+                self.scorer.lint_sql.return_value = [{"code": code} for code in codes]
+                self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), expected)
+
+    def test_sqlfluff_parse_errors_do_not_earn_style_points(self):
+        for code in ("PRS", "TMP", "LXR"):
+            with self.subTest(code=code):
+                self.scorer.lint_sql.return_value = [{"code": code}]
+                self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.9)
+
+    def test_sqlfluff_bonus_is_split_across_configured_rules(self):
+        self.scorer.sqlfluff_rules = ["LT01", "CP01"]
+        self.scorer.lint_sql.return_value = [{"code": "LT01"}]
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.95)
+
+    def test_empty_sqlfluff_rules_disable_the_bonus(self):
+        self.scorer.sqlfluff_rules = []
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.95)
+        self.scorer.lint_sql.assert_not_called()
+
+    def test_sqlfluff_score_is_configurable(self):
+        check, _, _ = self.scorer.reward_steps["sqlfluff"]
+        self.scorer.reward_steps["sqlfluff"] = (check, 0.02, -0.01)
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.97)
+        self.scorer.lint_sql.return_value = [{"code": "CP01"}]
+        self.assertAlmostEqual(self.scorer.score("SELECT x from t", self.row()), 0.9625)
+        self.scorer.lint_sql.return_value = [{"code": rule} for rule in self.scorer.sqlfluff_rules]
+        self.assertAlmostEqual(self.scorer.score("SELECT x from t", self.row()), 0.94)
+
+    def test_real_sqlfluff_spacing_and_capitalisation_rules(self):
+        try:
+            from sqlfluff import lint
+        except ImportError:
+            self.skipTest("sqlfluff is not installed; run in the training environment")
+        self.scorer.lint_sql = lint
+        for sql, expected in (("SELECT x FROM t", 1.0),
+                              ("SELECT  x FROM t", 0.975),
+                              ("SELECT x from t", 0.975),
+                              ("SELECT COUNT (x) FROM t", 0.95),  # Both LT01 and LT06 fail.
+                              ("SELECT COUNT(x) + count(x) FROM t", 0.975),
+                              ("SELECT  COUNT (x) + count(x) from t", 0.9)):
+            with self.subTest(sql=sql):
+                self.assertAlmostEqual(self.scorer.score(sql, self.row(gold=sql)), expected)
+
+    def test_reference_error_is_not_scored_as_a_model_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "Cannot execute reference SQL"):
+            self.scorer.score("SELECT x FROM t", self.row(gold="SELECT missing FROM t"))
+
+    def test_reference_results_are_cached(self):
+        with patch.object(self.scorer, "execute", wraps=self.scorer.execute) as execute:
+            self.scorer.score("SELECT 1", self.row())
+            self.scorer.score("SELECT 2", self.row())
+        self.assertEqual([call.args[1] for call in execute.call_args_list],
+                         ["SELECT x FROM t", "SELECT 1", "SELECT 2"])
+
+    def test_scores_can_be_changed_without_changing_checks(self):
+        check, _, _ = self.scorer.reward_steps["execution"]
+        self.scorer.reward_steps["execution"] = (check, 0.2, -0.8)
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.75)
+        self.assertAlmostEqual(self.scorer.score("SELECT 2", self.row()), -0.25)
+
+    def test_zero_sqlglot_scores_still_prevent_execution(self):
+        check, _, _ = self.scorer.reward_steps["sqlglot"]
+        self.scorer.reward_steps["sqlglot"] = (check, 0.0, 0.0)
+        self.scorer.read_query.side_effect = ValueError("invalid SQL")
+        with patch.object(self.scorer, "execute") as execute:
+            self.assertEqual(self.scorer.score("SELECT broken", self.row()), 0.1)
+            execute.assert_not_called()
+
+    def test_reward_steps_can_be_added_and_removed(self):
+        del self.scorer.reward_steps["execution"]
+        extra = Mock(return_value=(0.25, True))
+        self.scorer.reward_steps["extra"] = (extra, 0.25, -0.25)
+        with patch.object(self.scorer, "execute") as execute:
+            self.assertAlmostEqual(self.scorer.score("SELECT x FROM t", self.row()), 0.8)
+            execute.assert_not_called()
+        extra.assert_called_once()
+
+    def test_result_comparison_receives_prediction_ordering(self):
+        self.scorer.read_query.return_value = SimpleNamespace(args={"order": object()})
+        self.scorer.result_eq = Mock(return_value=True)
+        self.assertAlmostEqual(self.scorer.score("SELECT x FROM t ORDER BY x", self.row()), 1.0)
+        self.scorer.result_eq.assert_called_once_with([(1,)], [(1,)], order_matters=True)
 
 
 @unittest.skipIf(torch is None, "torch is not installed; tensor checks require the training environment")
@@ -110,12 +289,23 @@ class SQLTokenRewardTests(unittest.TestCase):
             responses, tokenizer, None, None, ["{}"] * 3, scorer,
         )
         self.assertEqual(rewards.tolist(), [[-1, 0, 0], [-1, 0, 0], [0, 1, 0]])
-        self.assertEqual(scorer.score.call_count, 2)
+        self.assertEqual(scorer.score.call_count, 3)
         # Match the trainer's mask: PAD-only responses retain the first penalty.
         lengths = torch.where(responses == 0, torch.arange(3), 3).min(dim=1).values - 1
         lengths = lengths.clamp(min=0)
         mask = torch.arange(3) > lengths[:, None]
         self.assertEqual(rewards.masked_fill(mask, 0).sum(dim=1).tolist(), [-1, -1, 1])
+
+    def test_pad_only_response_uses_configured_empty_output_score(self):
+        scorer = Mock()
+        scorer.score.return_value = -0.75
+        tokenizer = SimpleNamespace(pad_token_id=0, decode=Mock())
+        rewards = sql_rewards.sql_outcome_reward(
+            torch.tensor([[0, 0]]), tokenizer, None, None, ['{"db_id": "demo"}'], scorer,
+        )
+        self.assertEqual(rewards.tolist(), [[-0.75, 0]])
+        scorer.score.assert_called_once_with("", {"db_id": "demo"})
+        tokenizer.decode.assert_not_called()
 
 
 class SQLDatasetTests(unittest.TestCase):

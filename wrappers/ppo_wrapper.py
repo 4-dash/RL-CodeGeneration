@@ -78,10 +78,12 @@ class PPOWrapper(PPOTrainer):
             eval_dataset=processed_dataset_for_model_generation["test"],
             data_collator=collator
         )
-        self.syncode_logits_processor = None
+        self.syncode_logits_processor = SyncodeLogitsListWrapper(
+            dataset_helper.tokenizer, self.args.local_rollout_forward_batch_size,
+            language="sql" if self.sql_task else "python",
+        )
         self.linter_function = None
         if not self.sql_task:
-            self.syncode_logits_processor = SyncodeLogitsListWrapper(dataset_helper.tokenizer, self.args.local_rollout_forward_batch_size)
             self.linter_function = ruff_linter_reward
 
     def train(self):
@@ -179,11 +181,11 @@ class PPOWrapper(PPOTrainer):
                         args.local_rollout_forward_batch_size,
                         processing_class.pad_token_id,
                         generation_config,
-                        None if self.sql_task else [self.syncode_logits_processor],
+                        [self.syncode_logits_processor],
                     )
                 for i in range(0, queries.shape[0], args.local_rollout_forward_batch_size):
                     query_response = query_responses[i : i + args.local_rollout_forward_batch_size]
-                    syncode_score = None if self.sql_task else syncode_scores[i: i + args.local_rollout_forward_batch_size]
+                    syncode_score = syncode_scores[i: i + args.local_rollout_forward_batch_size]
                     label = labels[i: i + args.local_rollout_forward_batch_size]
                     if unit_tests is not None:
                         unit_test = unit_tests[i: i + args.local_rollout_forward_batch_size]
@@ -225,7 +227,7 @@ class PPOWrapper(PPOTrainer):
                     value = full_value[:, context_length - 1 : -1].squeeze(-1)
 
                     if self.sql_task:
-                        score = torch.zeros_like(postprocessed_response, dtype=torch.bfloat16)
+                        score = self.syncode_coef * syncode_score.to(postprocessed_response.device)
                     else:
                         score, _ = self.linter_function(
                                 postprocessed_response,
