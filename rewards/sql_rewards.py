@@ -1,6 +1,7 @@
 """Combine configurable checks into one RBAC SQL training reward."""
 
 import json
+import logging
 from contextlib import closing
 import sqlite3
 import sys
@@ -22,6 +23,8 @@ class SQLScorer:
         import sqlglot
         from sqlfluff import lint
 
+        # Suppress verbose parse trees while keeping SQLFluff warnings and errors.
+        logging.getLogger("sqlfluff").setLevel(logging.WARNING)
         self.sqlglot = sqlglot
         self.lint_sql = lint
         self.clean = clean_model_response
