@@ -3,6 +3,7 @@
 import json
 import os
 from pathlib import Path
+import random
 
 from eval.rbac import build_messages, iter_dataset
 
@@ -69,13 +70,20 @@ class SQLDatasetHelper:
 
         with PartialState().local_main_process_first():
             data_path = resolve_training_data(cache_dir)
+            rows = list(iter_dataset(data_path))
+            if not rows:
+                raise ValueError("RBAC training data is empty")
+            sample_size = int(os.environ.get("RBAC_SAMPLE_SIZE", "5000"))
+            seed = int(os.environ.get("RBAC_SAMPLE_SEED", "42"))
+            if sample_size <= 0:
+                raise ValueError("RBAC_SAMPLE_SIZE must be positive")
+            if len(rows) > sample_size:
+                rows = random.Random(seed).sample(rows, sample_size)
             # Arrow unifies dictionary keys across rows. Keep raw rows serialized
             # until prompting/scoring metadata is prepared so policies stay exact.
             dataset = Dataset.from_dict({
-                "row_json": [json.dumps(row) for row in iter_dataset(data_path)]
+                "row_json": [json.dumps(row) for row in rows]
             })
-            if not len(dataset):
-                raise ValueError("RBAC training data is empty")
             dataset = dataset.map(prepare, remove_columns=dataset.column_names)
         self.model_input_size = max(len(ids) for ids in dataset["input_ids"])
         self.tokenized_dataset = DatasetDict(train=dataset)

@@ -28,7 +28,7 @@ class SampleTrainingScriptTests(unittest.TestCase):
         self.rows = [
             {"id": i, "db_id": "demo", "policy": {"t": ["x"]},
              "metadata": {"permission": "allowed" if i % 2 else "denied"}}
-            for i in range(300)
+            for i in range(6000)
         ]
         self.source = self.benchmark / "data/selected/spider/column_level_rbac_dataset_spider_train_v3_no_sm.json"
         self.source.parent.mkdir(parents=True)
@@ -73,8 +73,8 @@ class SampleTrainingScriptTests(unittest.TestCase):
         self.assertEqual(len(runs), 2)
         samples = [json.loads((run / "sample.json").read_text()) for run in runs]
         self.assertEqual(samples[0], samples[1])
-        self.assertEqual(len(samples[0]), 256)
-        self.assertEqual(len({row['id'] for row in samples[0]}), 256)
+        self.assertEqual(len(samples[0]), 5000)
+        self.assertEqual(len({row['id'] for row in samples[0]}), 5000)
         for run in runs:
             launch = json.loads((run / "launch.json").read_text())
             args = launch["args"]
@@ -88,7 +88,7 @@ class SampleTrainingScriptTests(unittest.TestCase):
         self.assertEqual(json.loads(self.source.read_text()), self.rows)
 
     def test_full_dataset_and_missing_database_do_not_launch(self):
-        result = self.run_script(RBAC_SAMPLE_SIZE="300")
+        result = self.run_script(RBAC_SAMPLE_SIZE="6000")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('smaller than the source', result.stderr)
         self.database.unlink()
@@ -129,7 +129,7 @@ class SampleTrainingScriptTests(unittest.TestCase):
             "cache_dir": str(self.root / "cache"),
         })
         run, = self.runs.iterdir()
-        self.assertEqual(len(json.loads((run / "sample.json").read_text())), 256)
+        self.assertEqual(len(json.loads((run / "sample.json").read_text())), 5000)
         launch = json.loads((run / "launch.json").read_text())
         self.assertEqual(launch["sample"], str(run / "sample.json"))
 

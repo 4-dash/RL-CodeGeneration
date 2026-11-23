@@ -309,14 +309,9 @@ class SQLTokenRewardTests(unittest.TestCase):
 
 
 class SQLDatasetTests(unittest.TestCase):
-    def test_original_policy_reaches_prompt_and_reward_without_added_keys(self):
-        rows = [
-            {"db_id": "demo", "instruction": "schema", "role": "reader", "input": "question",
-             "policy": policy, "metadata": {"permission": "allowed", "gold_sql": "SELECT 1"}}
-            for policy in ({"alpha": ["x"]}, {"beta": []})
-        ]
+    def prepare_rows(self, rows, **environment):
         tokenizer = SimpleNamespace(pad_token_id=0, eos_token_id=1, apply_chat_template=Mock())
-        tokenizer.apply_chat_template.side_effect = lambda messages, **kwargs: list(range(len(str(messages))))
+        tokenizer.apply_chat_template.return_value = [2, 3]
         dataset = Mock(column_names=["row_json"])
         processed = []
         serialized = {}
@@ -345,16 +340,57 @@ class SQLDatasetTests(unittest.TestCase):
         }
         with patch.dict(sys.modules, dependencies):
             module = load_file("sql_dataset_test", "rl_datasets/sql_dataset.py")
-            with patch.dict(os.environ, {"RBAC_BENCHMARK_DIR": "/unused"}):
+            with patch.dict(os.environ, {"RBAC_BENCHMARK_DIR": "/unused", "RBAC_SAMPLE_SIZE": "5000",
+                                         "RBAC_SAMPLE_SEED": "42", **environment}):
                 with patch.object(module, "iter_dataset", return_value=iter(rows)), \
                      patch.object(module, "resolve_training_data", return_value=Path("/training.json")) as resolve:
-                    module.SQLDatasetHelper("unused-model", "/unused-cache")
+                    helper = module.SQLDatasetHelper("unused-model", "/unused-cache")
         resolve.assert_called_once_with("/unused-cache")
+        return helper, processed, tokenizer, serialized, scorer
+
+    def test_original_policy_reaches_prompt_and_reward_without_added_keys(self):
+        rows = [
+            {"db_id": "demo", "instruction": "schema", "role": "reader", "input": "question",
+             "policy": policy, "metadata": {"permission": "allowed", "gold_sql": "SELECT 1"}}
+            for policy in ({"alpha": ["x"]}, {"beta": []})
+        ]
+        _, processed, tokenizer, serialized, _ = self.prepare_rows(rows)
+        self.assertEqual(len(processed), len(rows))
         self.assertTrue(all(isinstance(row, str) for row in serialized["row_json"]))
         for original, prepared, call in zip(rows, processed, tokenizer.apply_chat_template.call_args_list):
             self.assertEqual(call.args[0], build_messages(original))
             self.assertEqual(json.loads(prepared["reward_metadata"])["policy"], original["policy"])
         self.assertEqual(rows[0]["policy"], {"alpha": ["x"]})
+
+    def test_default_training_sample_has_5000_reproducible_random_rows(self):
+        rows = [{"id": i, **SQLScoringTests.row()} for i in range(6000)]
+        selections = []
+        for seed in ("42", "42", "43"):
+            _, processed, _, serialized, scorer = self.prepare_rows(rows, RBAC_SAMPLE_SEED=seed)
+            indices = [json.loads(row)["id"] for row in serialized["row_json"]]
+            self.assertEqual(len(processed), 5000)
+            self.assertEqual(len(set(indices)), 5000)
+            self.assertEqual(scorer.validate_reference.call_count, 5000)
+            self.assertNotEqual(indices, list(range(5000)))
+            selections.append(indices)
+        self.assertEqual(selections[0], selections[1])
+        self.assertNotEqual(selections[0], selections[2])
+        self.assertEqual([row["id"] for row in rows], list(range(6000)))
+
+    def test_explicit_smaller_sample_size_is_respected(self):
+        rows = [{"id": i, **SQLScoringTests.row()} for i in range(20)]
+        _, processed, _, serialized, _ = self.prepare_rows(rows, RBAC_SAMPLE_SIZE="7")
+        self.assertEqual(len(processed), 7)
+        self.assertEqual(len({json.loads(row)["id"] for row in serialized["row_json"]}), 7)
+
+    def test_nonpositive_sample_size_is_rejected(self):
+        for size in ("0", "-1"):
+            with self.subTest(size=size), self.assertRaisesRegex(ValueError, "RBAC_SAMPLE_SIZE must be positive"):
+                self.prepare_rows([SQLScoringTests.row()], RBAC_SAMPLE_SIZE=size)
+
+    def test_empty_training_file_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "RBAC training data is empty"):
+            self.prepare_rows([])
 
 
 class TrainingDataSourceTests(unittest.TestCase):
