@@ -88,6 +88,7 @@ class PPOWrapper(PPOTrainer):
 
     def train(self):
         args = self.args
+        start_training_log(args.output_dir)
         accelerator = self.accelerator
         optimizer = self.optimizer
         model = self.model

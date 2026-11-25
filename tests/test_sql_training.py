@@ -1,12 +1,14 @@
 """SQL regression checks without downloading models or starting training."""
 
 import ast
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
 import importlib.util
 import json
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -35,6 +37,83 @@ except ImportError:
     torch = None
 with patch.dict(sys.modules, {"torch": torch or SimpleNamespace()}):
     sql_rewards = load_file("sql_rewards_test", "rewards/sql_rewards.py")
+
+
+class TrainingLogTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="training logs ")
+        self.addCleanup(self.temporary.cleanup)
+        self.output = Path(self.temporary.name) / "run with spaces"
+        # Load the logging helper without importing models or the training stack.
+        tree = ast.parse((PROJECT / "wrappers/wrapper_utils.py").read_text())
+        helper = next(node for node in tree.body
+                      if isinstance(node, ast.FunctionDef) and node.name == "start_training_log")
+        self.source = "import atexit, os, subprocess, sys\n" + ast.unparse(helper)
+
+    def run_logged_process(self, rank, ending=""):
+        source = self.source + '''
+start_training_log(sys.argv[1])
+rank = os.environ.get("RANK", "0")
+print(f"python stdout rank={rank}")
+print(f"python stderr rank={rank}", file=sys.stderr)
+os.write(1, f"native stdout rank={rank}\\n".encode())
+os.write(2, f"native stderr rank={rank}\\n".encode())
+''' + ending
+        env = dict(os.environ)
+        env.pop("RANK", None)
+        if rank is not None:
+            env["RANK"] = str(rank)
+        return subprocess.run(
+            [sys.executable, "-c", source, str(self.output)],
+            env=env, capture_output=True, text=True, timeout=20,
+        )
+
+    def test_various_rank_counts_keep_combined_and_individual_logs(self):
+        root = self.output
+        for count in (1, 2, 4, 8):
+            with self.subTest(ranks=count):
+                self.output = root / f"{count} ranks"
+                with ThreadPoolExecutor(max_workers=count) as pool:
+                    results = list(pool.map(self.run_logged_process, range(count)))
+                combined = (self.output / "train.log").read_text()
+                for rank, result in enumerate(results):
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    contents = (self.output / f"rank{rank}.log").read_text()
+                    for message in ("python stdout", "python stderr", "native stdout", "native stderr"):
+                        text = f"{message} rank={rank}"
+                        self.assertIn(text, contents)
+                        self.assertIn(text, combined)
+                        self.assertIn(text, result.stdout)
+                    for other in range(count):
+                        if other != rank:
+                            self.assertNotIn(f"python stdout rank={other}\n", contents)
+                self.assertEqual(len(list(self.output.glob("*.log"))), count + 1)
+
+    def test_single_process_without_rank_defaults_to_rank_zero(self):
+        result = self.run_logged_process(None)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.output / "train.log").read_text(),
+                         (self.output / "rank0.log").read_text())
+
+    def test_traceback_is_saved_and_failure_exit_status_is_preserved(self):
+        result = self.run_logged_process(0, 'raise RuntimeError("training failed")\n')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("RuntimeError: training failed", result.stdout)
+        self.assertIn("RuntimeError: training failed", (self.output / "train.log").read_text())
+        self.assertIn("RuntimeError: training failed", (self.output / "rank0.log").read_text())
+
+    def test_native_output_is_saved_even_without_python_cleanup(self):
+        result = self.run_logged_process(1, 'os._exit(23)\n')
+        self.assertEqual(result.returncode, 23)
+        self.assertIn("native stderr", (self.output / "rank1.log").read_text())
+        self.assertIn("native stderr", (self.output / "train.log").read_text())
+
+    def test_existing_log_contents_are_preserved(self):
+        self.output.mkdir()
+        (self.output / "train.log").write_text("previous output\n")
+        result = self.run_logged_process(0)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.output / "train.log").read_text().startswith("previous output\n"))
 
 
 class SQLScoringTests(unittest.TestCase):

@@ -1,9 +1,47 @@
+import atexit
+import os
+import subprocess
+import sys
+
 from transformers import GenerationConfig, LogitsProcessorList, AutoModelForCausalLM, BitsAndBytesConfig, AutoModelForSequenceClassification, StoppingCriteriaList
 from transformers.data.data_collator import DataCollatorWithPadding
 import torch
 from trl.trainer.utils import pad
 from trl import get_peft_config, create_reference_model, AutoModelForCausalLMWithValueHead
 from peft import PeftModel
+
+def start_training_log(output_dir):
+    """Save console/native output to the combined training log and this rank's log."""
+    os.makedirs(output_dir, exist_ok=True)
+    rank = int(os.environ.get("RANK", "0"))
+    log_path = os.path.join(output_dir, f"rank{rank}.log")
+    training_log = os.path.join(output_dir, "train.log")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    # A separate tee process also captures native writes to stdout/stderr and
+    # keeps draining the pipe if the training process aborts inside CUDA/NCCL.
+    tee = subprocess.Popen(["tee", "-a", log_path, training_log], stdin=subprocess.PIPE)
+    stdout_fd, stderr_fd = os.dup(1), os.dup(2)
+    os.dup2(tee.stdin.fileno(), 1)
+    os.dup2(tee.stdin.fileno(), 2)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(line_buffering=True, write_through=True)
+
+    def finish_log():
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os.dup2(stdout_fd, 1)
+            os.dup2(stderr_fd, 2)
+            os.close(stdout_fd)
+            os.close(stderr_fd)
+            tee.stdin.close()
+            tee.wait()
+
+    atexit.register(finish_log)
+    print(f"Training log (rank {rank}): {log_path}", flush=True)
 
 def score(self, hidden_states):
     """
